@@ -47,6 +47,9 @@ logger = logging.getLogger(__name__)
 
 CircuitState = Literal["CLOSED", "OPEN", "HALF_OPEN"]
 
+# (old_state, new_state, snapshot_at_transition) -> None
+StateChangeHook = Callable[[CircuitState, CircuitState, "CircuitSnapshot"], None]
+
 CLOSED: CircuitState = "CLOSED"
 OPEN: CircuitState = "OPEN"
 HALF_OPEN: CircuitState = "HALF_OPEN"
@@ -73,6 +76,7 @@ class CircuitSnapshot:
     opened_at: str | None
     transitions: int
     half_open_calls_remaining: int
+    last_state_change_at: str | None
 
     def to_dict(self) -> dict:
         return {
@@ -85,6 +89,7 @@ class CircuitSnapshot:
             "opened_at": self.opened_at,
             "transitions": self.transitions,
             "half_open_calls_remaining": self.half_open_calls_remaining,
+            "last_state_change_at": self.last_state_change_at,
         }
 
 
@@ -106,6 +111,7 @@ class CircuitBreaker:
         window_seconds: float = 60.0,
         name: str = "circuit",
         time_fn: Callable[[], float] | None = None,
+        on_state_change: StateChangeHook | None = None,
     ) -> None:
         if failure_threshold < 1:
             raise ValueError("failure_threshold must be >= 1")
@@ -117,6 +123,7 @@ class CircuitBreaker:
         self.cooldown_seconds = float(cooldown_seconds)
         self.half_open_test_calls = half_open_test_calls
         self.window_seconds = float(window_seconds)
+        self.on_state_change = on_state_change
         # Resolved through the module on every call, not captured at import. A
         # captured reference would hold the ORIGINAL `time.monotonic` and silently
         # ignore any runtime patch of the clock — which is also what makes this
@@ -133,6 +140,7 @@ class CircuitBreaker:
         self._transitions = 0
         self._last_failure_wall: datetime | None = None
         self._opened_at_wall: datetime | None = None
+        self._last_state_change_wall: datetime | None = None
 
     # -- internals (call with the lock held) --------------------------------
     def _prune(self, now: float) -> None:
@@ -141,11 +149,15 @@ class CircuitBreaker:
             self._failures.popleft()
 
     def _transition(self, new_state: CircuitState, now: float) -> None:
+        # The early return is what makes `on_state_change` fire on real
+        # transitions only: re-entering the state you are already in is not an
+        # event, and alerting on it would train operators to ignore the alert.
         if new_state == self._state:
             return
         old = self._state
         self._state = new_state
         self._transitions += 1
+        self._last_state_change_wall = datetime.now(timezone.utc)
 
         if new_state == OPEN:
             self._opened_at = now
@@ -159,7 +171,31 @@ class CircuitBreaker:
             self._half_open_remaining = 0
             self._failures.clear()
 
-        logger.warning("circuit %r: %s -> %s", self.name, old, new_state)
+        # DEBUG, not WARNING: `on_state_change` owns the operator-facing record and
+        # its severity split. Logging every transition at WARNING here too would
+        # both duplicate that line and stamp a recovery as a warning.
+        logger.debug("circuit %r: %s -> %s", self.name, old, new_state)
+        self._notify(old, new_state)
+
+    def _notify(self, old: CircuitState, new: CircuitState) -> None:
+        """Hand the transition to the observer. Never let it break the caller.
+
+        Invoked with the lock held, so the snapshot the observer receives is the
+        one that belongs to this transition rather than a later state. The lock is
+        an RLock, so a handler may call back into the breaker; a handler that
+        blocks, however, blocks every other thread, so handlers must stay cheap.
+        A raising handler is logged and swallowed: alerting is observability, and
+        observability must never be able to fail a money-path call.
+        """
+        if self.on_state_change is None:
+            return
+        try:
+            self.on_state_change(old, new, self._snapshot_locked())
+        except Exception:  # noqa: BLE001 - a bad observer must not break the breaker
+            logger.exception(
+                "circuit %r: on_state_change handler raised on %s -> %s",
+                self.name, old, new,
+            )
 
     def _maybe_open_to_half(self, now: float) -> None:
         """OPEN outlives its cooldown -> HALF_OPEN. Lazy, so no timer thread."""
@@ -238,25 +274,38 @@ class CircuitBreaker:
             now = self._now()
             self._maybe_open_to_half(now)
             self._prune(now)
+            return self._snapshot_locked()
 
-            next_test_at = None
-            if self._state == OPEN and self._opened_at_wall is not None:
-                next_test = self._opened_at_wall.timestamp() + self.cooldown_seconds
-                next_test_at = datetime.fromtimestamp(next_test, timezone.utc).isoformat()
+    def _snapshot_locked(self) -> CircuitSnapshot:
+        """Build a snapshot from current fields. The lock must already be held.
 
-            return CircuitSnapshot(
-                state=self._state,
-                failure_count_in_window=len(self._failures),
-                window_seconds=int(self.window_seconds),
-                failure_threshold=self.failure_threshold,
-                last_failure_at=(
-                    self._last_failure_wall.isoformat() if self._last_failure_wall else None
-                ),
-                next_test_at=next_test_at,
-                opened_at=(self._opened_at_wall.isoformat() if self._opened_at_wall else None),
-                transitions=self._transitions,
-                half_open_calls_remaining=self._half_open_remaining,
-            )
+        Split out so `_notify` can hand an observer the snapshot belonging to the
+        transition that just happened, without re-entering the transition logic and
+        without racing another thread between the change and the read.
+        """
+        next_test_at = None
+        if self._state == OPEN and self._opened_at_wall is not None:
+            next_test = self._opened_at_wall.timestamp() + self.cooldown_seconds
+            next_test_at = datetime.fromtimestamp(next_test, timezone.utc).isoformat()
+
+        return CircuitSnapshot(
+            state=self._state,
+            failure_count_in_window=len(self._failures),
+            window_seconds=int(self.window_seconds),
+            failure_threshold=self.failure_threshold,
+            last_failure_at=(
+                self._last_failure_wall.isoformat() if self._last_failure_wall else None
+            ),
+            next_test_at=next_test_at,
+            opened_at=(self._opened_at_wall.isoformat() if self._opened_at_wall else None),
+            transitions=self._transitions,
+            half_open_calls_remaining=self._half_open_remaining,
+            last_state_change_at=(
+                self._last_state_change_wall.isoformat()
+                if self._last_state_change_wall
+                else None
+            ),
+        )
 
     def reset(self) -> None:
         """Back to a clean CLOSED breaker. For tests and for an operator override."""
@@ -268,3 +317,4 @@ class CircuitBreaker:
             self._last_failure_wall = None
             self._half_open_remaining = 0
             self._transitions = 0
+            self._last_state_change_wall = None

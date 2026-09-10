@@ -522,3 +522,133 @@ def test_health_endpoint_reports_open_state_with_next_test_at():
     assert body["last_failure_at"] is not None
     assert body["next_test_at"] is not None
     assert body["circuit_transitions"] >= 1
+
+
+# ===========================================================================
+# on_state_change alerting hook
+# ===========================================================================
+def test_on_state_change_fires_on_every_real_transition():
+    clock = FakeClock()
+    seen: list[tuple[str, str, str | None]] = []
+    cb = make_breaker(
+        clock,
+        on_state_change=lambda old, new, snap: seen.append(
+            (old, new, snap.last_state_change_at)
+        ),
+    )
+
+    for _ in range(3):
+        cb.record_failure()          # CLOSED -> OPEN
+    clock.advance(61)
+    assert cb.state == HALF_OPEN     # OPEN -> HALF_OPEN
+    cb.allows_call()
+    cb.record_success()              # HALF_OPEN -> CLOSED
+
+    assert [(o, n) for o, n, _ in seen] == [
+        (CLOSED, OPEN),
+        (OPEN, HALF_OPEN),
+        (HALF_OPEN, CLOSED),
+    ]
+    assert all(ts is not None for _, _, ts in seen), "each hook gets its own timestamp"
+
+
+def test_on_state_change_does_not_fire_without_a_transition():
+    """Re-entering the state you are already in is not an event.
+
+    Alerting on it would fire on every failure once open, and an alert that fires
+    constantly is one operators learn to ignore.
+    """
+    clock = FakeClock()
+    seen: list[tuple[str, str]] = []
+    cb = make_breaker(clock, on_state_change=lambda old, new, _s: seen.append((old, new)))
+
+    cb.record_failure()
+    cb.record_failure()
+    assert seen == [], "no transition yet, so no notification"
+
+    cb.record_failure()              # the one real transition
+    assert seen == [(CLOSED, OPEN)]
+
+    for _ in range(5):               # already OPEN; must stay quiet
+        cb.record_failure()
+    assert seen == [(CLOSED, OPEN)]
+
+    cb.record_success()              # CLOSED -> CLOSED is not a transition either
+    fresh = make_breaker(FakeClock(), on_state_change=lambda *a: seen.append(("x", "y")))
+    fresh.record_success()
+    assert seen == [(CLOSED, OPEN)]
+
+
+def test_default_handler_logs_at_the_right_level(caplog):
+    """Degrading transitions WARN, recovery transitions INFO.
+
+    The split is the whole point: an aggregator should be able to page on the way
+    down without also paging on the way back up.
+    """
+    diagnosis.TIER2_BREAKER.reset()
+    with caplog.at_level("INFO", logger="layers.diagnosis"):
+        for _ in range(3):
+            diagnosis.TIER2_BREAKER.record_failure()          # CLOSED -> OPEN
+        diagnosis.TIER2_BREAKER._opened_at -= settings_cooldown() + 1
+        assert diagnosis.TIER2_BREAKER.state == HALF_OPEN     # OPEN -> HALF_OPEN
+        diagnosis.TIER2_BREAKER.allows_call()
+        diagnosis.TIER2_BREAKER.record_success()              # HALF_OPEN -> CLOSED
+
+    circuit_logs = [r for r in caplog.records if r.getMessage().startswith("gemini circuit ")]
+    by_transition = {r.getMessage().split(" at ")[0]: r.levelname for r in circuit_logs}
+
+    assert by_transition["gemini circuit CLOSED -> OPEN"] == "WARNING"
+    assert by_transition["gemini circuit OPEN -> HALF_OPEN"] == "INFO"
+    assert by_transition["gemini circuit HALF_OPEN -> CLOSED"] == "INFO"
+    # format contract: "... at {ts}, failures={n}, next_test_at={ts_or_null}"
+    opened = next(m for m in by_transition if m.endswith("CLOSED -> OPEN"))
+    full = next(r.getMessage() for r in circuit_logs if r.getMessage().startswith(opened))
+    assert ", failures=3, next_test_at=" in full
+
+
+def test_half_open_to_open_is_logged_as_a_warning(caplog):
+    diagnosis.TIER2_BREAKER.reset()
+    with caplog.at_level("INFO", logger="layers.diagnosis"):
+        for _ in range(3):
+            diagnosis.TIER2_BREAKER.record_failure()
+        diagnosis.TIER2_BREAKER._opened_at -= settings_cooldown() + 1
+        assert diagnosis.TIER2_BREAKER.state == HALF_OPEN
+        diagnosis.TIER2_BREAKER.record_failure()              # HALF_OPEN -> OPEN
+
+    rec = next(
+        r for r in caplog.records
+        if r.getMessage().startswith("gemini circuit HALF_OPEN -> OPEN")
+    )
+    assert rec.levelname == "WARNING"
+
+
+def test_a_raising_handler_does_not_break_the_breaker(caplog):
+    """Observability must never be able to fail a money-path call."""
+    def explode(_old, _new, _snap):
+        raise RuntimeError("aggregator is down")
+
+    cb = make_breaker(FakeClock(), on_state_change=explode)
+
+    with caplog.at_level("ERROR"):
+        for _ in range(3):
+            cb.record_failure()
+
+    assert cb.state == OPEN, "the state machine must advance despite the bad handler"
+    assert cb.allows_call() is False
+    assert any("on_state_change handler raised" in r.getMessage() for r in caplog.records)
+
+
+def test_health_endpoint_exposes_last_state_change_at():
+    from fastapi.testclient import TestClient
+
+    import app as app_module
+
+    body = TestClient(app_module.app).get("/api/health/gemini").json()
+    assert "last_state_change_at" in body
+    assert body["last_state_change_at"] is None
+
+    for _ in range(3):
+        diagnosis.TIER2_BREAKER.record_failure()
+
+    body = TestClient(app_module.app).get("/api/health/gemini").json()
+    assert body["last_state_change_at"] is not None

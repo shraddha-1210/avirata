@@ -177,12 +177,37 @@ def clear_tier2_cache() -> None:
 # stop. Conversely a malformed JSON reply counts as NEITHER — Gemini answered, we
 # reached it fine, the reply was simply unusable, and quarantine already handles it.
 # ---------------------------------------------------------------------------
+# Transitions that mean the dependency got worse. Split by severity so an
+# aggregator can page on WARN and merely record the recovery path, rather than
+# treating "recovered" and "went down" as the same event.
+_DEGRADING_TRANSITIONS = frozenset({("CLOSED", "OPEN"), ("HALF_OPEN", "OPEN")})
+
+
+def log_circuit_transition(old: str, new: str, snap) -> None:
+    """Structured, single-line record of every Tier 2 circuit transition.
+
+    Deliberately just a log: operators wire their own aggregator against it, and a
+    build that posted to Slack from inside the money path would add an outbound
+    dependency to the code that exists to survive a failing outbound dependency.
+    """
+    message = (
+        "gemini circuit %s -> %s at %s, failures=%s, next_test_at=%s"
+    )
+    args = (old, new, snap.last_state_change_at, snap.failure_count_in_window,
+            snap.next_test_at)
+    if (old, new) in _DEGRADING_TRANSITIONS:
+        logger.warning(message, *args)
+    else:
+        logger.info(message, *args)
+
+
 TIER2_BREAKER = CircuitBreaker(
     failure_threshold=settings.circuit_failure_threshold,
     cooldown_seconds=settings.circuit_cooldown_seconds,
     half_open_test_calls=settings.circuit_half_open_test_calls,
     window_seconds=settings.circuit_window_seconds,
     name="gemini-tier2",
+    on_state_change=log_circuit_transition,
 )
 
 # Retry counters. Deliberately plain ints behind the same lock-free read the health
