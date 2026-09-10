@@ -167,9 +167,10 @@ What each layer owns, and the specific failure it exists to prevent:
   An operator reviewing the Ops queue maps a quarantined string to a cause; that writes a
   Tier 1 rule, and the next event carrying the identical string resolves instantly with no LLM
   call. This is the only path by which the ontology grows, and it runs through a human on
-  purpose. Demo scope, stated plainly: the rule lives in the process's `TIER1_RULES` dict, does
-  not survive a restart, and records no approver; production would persist it with an audit
-  record naming who signed off.
+  purpose. The rule is written to `tier1_promoted_rules` before it is applied in memory, so it
+  survives a restart and a failed write leaves Tier 1 untouched. Demo scope, stated plainly: it
+  records no approver — every row is written as 'ops' because this build has no auth — and
+  production would carry an audit record naming who signed off.
 
 ## Screenshots
 
@@ -250,9 +251,9 @@ in the panel is a rendering the API cannot back.
 
 Every number below is produced by code in this repo and reproducible from a fixed seed.
 
-**126 tests pass.** The database-backed tests run against real PostgreSQL 16: the idempotency and
+**193 tests pass.** The database-backed tests run against real PostgreSQL 16: the idempotency and
 reconciliation guarantees are constraint behaviour, so testing them against SQLite or a mocked lock
-would prove nothing. If Postgres is unreachable those 25 tests *skip loudly* rather than passing
+would prove nothing. If Postgres is unreachable those 98 tests *skip loudly* rather than passing
 vacuously. The Tier 2 LLM call is mocked in every test; CI never touches the network.
 
 **Diagnosis: 240/240 correct outcomes on the seeded corpus.** 232 events carried a
@@ -309,6 +310,23 @@ the risk gate always tripped first, making the second gate dead code. It was ret
   (`risk_weight_amount` 0.4→0.5, `ALT_RAIL_COST_RUPEES` 12→1600) until it independently blocks
   real events, and `test_cost_benefit_gate_is_reachable` fails if a future retune kills it
   again.
+- **Money-touching webhooks can be authenticated.** `POST /api/events/ingest` and
+  `POST /api/webhooks/settlement` verify an `X-Avirata-Signature` header carrying
+  HMAC-SHA256 over the **raw** request body, compared with `hmac.compare_digest` so a
+  short-circuiting comparison cannot leak the first wrong byte through timing. Signing the
+  parsed model instead of the raw bytes would let an attacker vary anything the parse
+  discards. Verification is opt-in: with `WEBHOOK_SIGNING_SECRET` unset every request is
+  accepted and the server says so once at startup, so an unsigned deployment is loud rather
+  than silent. The read-only and UI-facing routes are deliberately left open — signing them
+  would mean shipping the secret to the browser, which is not a secret.
+- **A webhook for an unknown mandate is an event, not a 500.** `decline_events.mandate_id` is
+  a foreign key, so a first-seen mandate would otherwise fail the insert. Ingest creates the
+  parent row through the same `ON CONFLICT DO NOTHING ... RETURNING` pattern used everywhere
+  else, and the `RETURNING` is what makes it safe under concurrency: two parallel webhooks for
+  the same unknown id would both pass a read-then-write check and one would still raise,
+  whereas here the loser simply gets no row back. Auto-creation is logged at WARN and the
+  mandate starts at a mid-scale reliability of 0.5 — guessing high would let an account with
+  no history clear risk gates that an account with a real track record has to earn.
 - **Sparse data never produces a false anomaly.** MAD detection in `layers/detection.py`
   checks `N ≥ 30` before any arithmetic and returns an explicit `insufficient_data` status.
 - **Gemini failures degrade gracefully.** A circuit breaker in `layers/circuit_breaker.py`
@@ -316,7 +334,12 @@ the risk gate always tripped first, making the second gate dead code. It was ret
   quarantine with reason "gemini circuit open (degraded mode)", which is visibly a system
   state rather than a wrong classification. Transient failures (network, 429, 5xx) retry with
   exponential backoff and full jitter; 4xx errors and malformed responses do not retry,
-  because repeating them does not help.
+  because repeating them does not help. Every state change emits one structured line —
+  `gemini circuit CLOSED -> OPEN at <ts>, failures=3, next_test_at=<ts>` — at WARN when the
+  dependency degrades and INFO when it recovers, so an aggregator can page on the way down
+  without also paging on the way back up. It fires on real transitions only: re-entering the
+  state you are already in is not an event, and an alert that fires on every failure while
+  open is one operators learn to ignore. `/api/health/gemini` exposes `last_state_change_at`.
 
 ## Honest scope
 
@@ -332,13 +355,16 @@ labelled *"controlled simulation, fixed seed"* on the dashboard itself. The cont
 self-healing baseline is a stated modelling assumption, and `ALT_RAIL_COST_RUPEES = 1600` is a
 fully-loaded cost assumption requiring finance sign-off, not a gateway fee.
 
-**Not built.** Multi-tenant auth, production observability, and real RBI e-mandate / AFA
-integration. Alt-rail execution is flagged in code as a **prototype requiring RBI e-mandate /
-AFA review before any production use**. Ontology promotions now persist to a
-`tier1_promoted_rules` table and are reloaded into Tier 1 at startup, so an approved rule
-survives a restart; what is still missing is the approver identity, since there is no auth
-and every row is written as 'ops'. Cron loops are demo-scale pollers; production would be
-event-driven.
+**Not built.** Multi-tenant auth and real RBI e-mandate / AFA integration. Alt-rail execution
+is flagged in code as a **prototype requiring RBI e-mandate / AFA review before any production
+use**. Ontology promotions now persist to a `tier1_promoted_rules` table and are reloaded into
+Tier 1 at startup, so an approved rule survives a restart; what is still missing is the
+approver identity, since there is no auth and every row is written as 'ops'. Webhook signing
+is a single shared secret, which authenticates the *sender* and is not per-tenant auth or key
+rotation. Observability stops at structured logs: the circuit breaker emits an alertable line
+on every transition, but nothing ships them anywhere and no aggregator, dashboard or pager is
+wired up — that is deliberately left to the operator. Cron loops are demo-scale pollers;
+production would be event-driven.
 
 ## Running it locally
 
@@ -354,6 +380,10 @@ copy .env.example .env                               # then fill GOOGLE_API_KEY
 ```
 
 Get a Gemini API key at **https://aistudio.google.com/apikey**.
+
+`WEBHOOK_SIGNING_SECRET` is optional and empty by default, which keeps the demo runnable with
+no key material. Set it to require a signed `X-Avirata-Signature` on the two money-touching
+webhooks; the server logs a startup warning while it is unset.
 
 ```bash
 .venv\Scripts\python scripts\seed_demo.py --live     # 240 events through the real pipeline
