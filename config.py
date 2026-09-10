@@ -70,6 +70,14 @@ class Settings(BaseSettings):
     circuit_half_open_test_calls: int = 1
     circuit_window_seconds: int = 60
 
+    # --- webhook authenticity ---
+    # OPT-IN. Unset means every webhook is accepted, which is what keeps the demo
+    # runnable with no key material; the app logs a warning at startup so an
+    # unsigned deployment is loud rather than silent. Set it in production: these
+    # two endpoints move money, and without a shared secret anyone who can reach
+    # the port can inject a decline or a settlement.
+    webhook_signing_secret: str | None = None
+
     # --- Layer 5: reconciliation ---
     settlement_hold_seconds: int = 300         # collision window for auto-refund of the losing path
 
