@@ -10,15 +10,18 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
+import hashlib
+import hmac
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import store
+from config import settings
 from db import get_session, init_db
 from layers.detection import check_anomaly
 from layers.pipeline import run_recovery
@@ -37,6 +40,53 @@ from layers.reconciliation import resolve_path
 
 logger = logging.getLogger(__name__)
 
+WEBHOOK_SIGNATURE_HEADER = "X-Avirata-Signature"
+
+# Reliability assigned to a mandate we are meeting for the first time. Deliberately
+# mid-scale: we have no history, and guessing high would let an unknown account
+# clear risk gates that an account with a real track record has to earn.
+AUTOCREATE_RELIABILITY = 0.5
+
+
+async def verify_webhook_signature(
+    request: Request,
+    x_avirata_signature: str | None = Header(default=None, alias=WEBHOOK_SIGNATURE_HEADER),
+) -> None:
+    """HMAC-SHA256 over the RAW request body, compared in constant time.
+
+    Applied only to the two endpoints that move money — decline ingest and the
+    settlement webhook. The UI-facing and read-only routes are deliberately left
+    open: signing them would mean shipping the secret to the browser, which is not
+    a secret.
+
+    Verification is OPT-IN. With no secret configured every request is accepted so
+    the demo keeps working; the startup log says so once, loudly. With a secret
+    configured a missing or wrong signature is a 401 and the handler never runs.
+
+    The signature covers the raw bytes, not the parsed model: re-serialising and
+    signing that would let an attacker vary anything the parse discards. Reading
+    the body here is safe because Starlette caches it, so the endpoint's own
+    Pydantic parsing still sees it.
+    """
+    secret = settings.webhook_signing_secret
+    if not secret:
+        return
+
+    if not x_avirata_signature:
+        raise HTTPException(
+            status_code=401,
+            detail=f"missing {WEBHOOK_SIGNATURE_HEADER} header",
+        )
+
+    body = await request.body()
+    expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+
+    # compare_digest, never ==: a short-circuiting comparison leaks the position of
+    # the first wrong byte through timing, which is enough to forge a signature.
+    if not hmac.compare_digest(expected, x_avirata_signature.strip()):
+        logger.warning("rejected webhook: bad %s", WEBHOOK_SIGNATURE_HEADER)
+        raise HTTPException(status_code=401, detail="invalid webhook signature")
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -52,6 +102,17 @@ async def lifespan(_app: FastAPI):
     the hardcoded baseline only. Promotion itself is NOT tolerant: it fails closed,
     so a degraded start cannot quietly accept a rule it will lose.
     """
+    if not settings.webhook_signing_secret:
+        logger.warning(
+            "WARNING: webhook signature verification disabled - set "
+            "WEBHOOK_SIGNING_SECRET in production"
+        )
+    else:
+        logger.info(
+            "webhook signature verification ENABLED on /api/events/ingest and "
+            "/api/webhooks/settlement"
+        )
+
     try:
         init_db()
         loaded = load_promoted_rules()
@@ -84,7 +145,10 @@ class DeclineEventIn(BaseModel):
     event_ts: datetime
     billing_cycle: str
     amount: int
-    mandate_reliability: float = Field(default=0.9, ge=0.0, le=1.0)
+    # Optional, and None means "the webhook did not tell us". A first-seen mandate
+    # is then created at AUTOCREATE_RELIABILITY rather than at an invented number
+    # that would flatter the risk scorecard on an account we know nothing about.
+    mandate_reliability: float | None = Field(default=None, ge=0.0, le=1.0)
     raw_error_code: str
     arm: Literal["treatment", "control"] | None = None
 
@@ -106,7 +170,7 @@ def gemini_health() -> dict:
     return tier2_metrics()
 
 
-@app.post("/api/events/ingest")
+@app.post("/api/events/ingest", dependencies=[Depends(verify_webhook_signature)])
 def ingest_event(event: DeclineEventIn) -> dict:
     """Persist a decline event, then run MAD detection on its segment.
 
@@ -117,14 +181,23 @@ def ingest_event(event: DeclineEventIn) -> dict:
     as_of = event.event_ts.date()
 
     with get_session() as session:
-        store.upsert_mandate(
+        created = store.upsert_mandate(
             session,
             mandate_id=event.mandate_id,
             customer_id=event.customer_id,
             bank=event.bank,
             mandate_type=event.mandate_type,
-            reliability_score=event.mandate_reliability,
+            reliability_score=(
+                event.mandate_reliability
+                if event.mandate_reliability is not None
+                else AUTOCREATE_RELIABILITY
+            ),
         )
+        if created:
+            logger.warning(
+                "auto-created mandate %s on first-seen event %s",
+                event.mandate_id, event.event_id,
+            )
         is_new = store.insert_decline_event(
             session,
             event={
@@ -216,7 +289,7 @@ class SettlementWebhookIn(BaseModel):
     amount: int | None = None
 
 
-@app.post("/api/webhooks/settlement")
+@app.post("/api/webhooks/settlement", dependencies=[Depends(verify_webhook_signature)])
 def settlement_webhook(req: SettlementWebhookIn) -> dict:
     """Record a settlement, auto-refunding a collision inside the hold window.
 

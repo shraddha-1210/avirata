@@ -27,7 +27,19 @@ def upsert_mandate(
     bank: str,
     mandate_type: str,
     reliability_score: float,
-) -> None:
+) -> bool:
+    """Ensure a mandate row exists. Returns True if THIS call created it.
+
+    `decline_events.mandate_id` is a foreign key, so a webhook naming a mandate we
+    have never seen would otherwise fail the insert. Creating the parent row here
+    means a first-seen mandate is a normal event rather than a 500.
+
+    The return value is what lets the caller log the auto-creation. It comes from
+    `RETURNING` on the INSERT rather than a preceding SELECT: two concurrent
+    webhooks for the same unknown mandate would both pass a read-then-write check
+    and one would still raise. With `ON CONFLICT DO NOTHING ... RETURNING`, the
+    loser gets no row back and reports False, and neither call fails.
+    """
     stmt = (
         pg_insert(Mandate)
         .values(
@@ -38,8 +50,9 @@ def upsert_mandate(
             reliability_score=reliability_score,
         )
         .on_conflict_do_nothing(index_elements=["mandate_id"])
+        .returning(Mandate.mandate_id)
     )
-    session.execute(stmt)
+    return session.execute(stmt).scalar_one_or_none() is not None
 
 
 def insert_decline_event(session: Session, *, event: dict) -> bool:
